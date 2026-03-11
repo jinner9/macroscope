@@ -1,0 +1,1242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>MACROSCOPE — Live Data Dashboard</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Bebas+Neue&family=Crimson+Pro:ital,wght@0,300;0,400;0,600;1,300&display=swap" rel="stylesheet"/>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { background: #060810; min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  API KEY CONFIGURATION  ██
+// ═══════════════════════════════════════════════════════════════════════════════
+// Get your FREE FRED key (no credit card, 2 minutes):
+//   https://fred.stlouisfed.org/docs/api/api_key.html
+// Paste it below — this is the only key needed for all 15 live indicators.
+//
+// Paste them here, save the file, and re-open it in your browser.
+
+const FRED_API_KEY   = "17843818f31dc4f55ba54d8ff75a4da1";
+const NASDAQ_API_KEY = "YOUR_NASDAQ_API_KEY_HERE";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  FRED SERIES REGISTRY  ██
+// Maps each indicator to its FRED series ID + metadata for display
+// ═══════════════════════════════════════════════════════════════════════════════
+const FRED_SERIES = {
+  // ── Liquidity ──────────────────────────────────────────────────────────────
+  FED_BALANCE:  { id:"WALCL",    tab:"liquidity",  fmt:"$T",   div:1e6,   decimals:2, label:"Fed Balance Sheet" },
+  RRP:          { id:"RRPONTSYD",tab:"liquidity",  fmt:"$B",   div:1e3,   decimals:0, label:"Reverse Repo (RRP)" },
+  TGA:          { id:"WTREGEN",  tab:"liquidity",  fmt:"$B",   div:1,     decimals:0, label:"Treasury Gen. Account" },
+  M2_YOY:       { id:"M2SL",     tab:"liquidity",  fmt:"%",    div:1,     decimals:1, label:"M2 Money Supply", calcYoY:true },
+  NFCI:         { id:"NFCI",     tab:"liquidity",  fmt:"",     div:1,     decimals:2, label:"Chicago Fed NFCI" },
+  HY_SPREADS:   { id:"BAMLH0A0HYM2",tab:"liquidity",fmt:"bps", div:1,     decimals:0, label:"HY Credit Spreads OAS" },
+  DXY:          { id:"DTWEXBGS", tab:"liquidity",  fmt:"",     div:1,     decimals:1, label:"DXY Broad USD Index" },
+  CI_LOANS:     { id:"TOTCI",    tab:"liquidity",  fmt:"%",    div:1,     decimals:1, label:"C&I Loans YoY", calcYoY:true },
+  SOFR:         { id:"SOFR",     tab:"liquidity",  fmt:"bps",  div:1,     decimals:2, label:"SOFR Rate" },
+  // ── Macro / Leading ────────────────────────────────────────────────────────
+  ISM_PMI:      { id:"MANEMP",   tab:"macro",      fmt:"",     div:1,     decimals:1, label:"Mfg Employment Proxy" },
+  YIELD_CURVE:  { id:"T10Y2Y",   tab:"macro",      fmt:"bps",  div:100,   decimals:0, label:"2s10s Yield Curve", multBps:true },
+  JOBLESS:      { id:"IC4WSA",   tab:"macro",      fmt:"K",    div:1e3,   decimals:0, label:"Initial Claims 4-wk avg" },
+  NAHB:         { id:"HOUST",    tab:"macro",      fmt:"K",    div:1,     decimals:0, label:"Housing Starts" },
+  MICH:         { id:"UMCSENT",  tab:"macro",      fmt:"",     div:1,     decimals:1, label:"Michigan Sentiment" },
+  // ── Technicals (FRED-available) ────────────────────────────────────────────
+  VIX:          { id:"VIXCLS",   tab:"technicals", fmt:"",     div:1,     decimals:1, label:"VIX" },
+  SPX:          { id:"SP500",    tab:"technicals", fmt:"",     div:1,     decimals:0, label:"S&P 500" },
+  MOODY_BAA:    { id:"BAA",      tab:"technicals", fmt:"%",    div:1,     decimals:2, label:"Moody's Baa Yield" },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  FETCH ENGINE  ██
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Cache in-memory so refresh doesn't re-fetch every series on every tab switch
+const _cache = {};
+
+// These functions read keys from window._FRED_KEY / window._NASDAQ_KEY at call time,
+// so runtime key entry (via the setup banner) works without a page reload.
+// CORS proxy list — tried in order, falls back if one is down
+// These proxies accept null origin (local file://)
+const CORS_PROXIES = [
+  url => `https://thingproxy.freeboard.io/fetch/${url}`,
+  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+  url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+];
+
+async function fetchWithCorsProxy(targetUrl) {
+  let lastErr;
+  for (const makeProxy of CORS_PROXIES) {
+    try {
+      const res = await fetch(makeProxy(targetUrl));
+      if (res.ok) return res;
+      lastErr = new Error(`HTTP ${res.status}`);
+    } catch(e) { lastErr = e; }
+  }
+  // Last resort: try direct (works if FRED ever adds CORS headers)
+  try {
+    const res = await fetch(targetUrl);
+    if (res.ok) return res;
+  } catch(e) {}
+  throw lastErr;
+}
+
+async function fetchFredSeries(seriesId, count = 104) {
+  const apiKey = window._FRED_KEY || FRED_API_KEY;
+  const cacheKey = `fred_${seriesId}_${apiKey.slice(0,6)}`;
+  if (_cache[cacheKey]) return _cache[cacheKey];
+  const targetUrl = `https://api.stlouisfed.org/fred/series/observations` +
+    `?series_id=${seriesId}&api_key=${apiKey}&file_type=json` +
+    `&sort_order=desc&limit=${count}`;
+  const res = await fetchWithCorsProxy(targetUrl);
+  if (!res.ok) throw new Error(`FRED ${seriesId}: HTTP ${res.status}`);
+  const json = await res.json();
+  if (json.error_message) throw new Error(`FRED ${seriesId}: ${json.error_message}`);
+  const obs = json.observations
+    .filter(o => o.value !== "." && o.value !== "")
+    .reverse()
+    .map(o => ({ date: o.date, value: parseFloat(o.value) }));
+  _cache[cacheKey] = obs;
+  return obs;
+}
+
+async function fetchNasdaqSeries(datasetCode, count = 52) {
+  const apiKey = window._NASDAQ_KEY || NASDAQ_API_KEY;
+  const cacheKey = `nasdaq_${datasetCode}_${apiKey.slice(0,6)}`;
+  if (_cache[cacheKey]) return _cache[cacheKey];
+  const url = `https://data.nasdaq.com/api/v3/datasets/${datasetCode}.json` +
+    `?api_key=${apiKey}&rows=${count}&order=asc`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Nasdaq ${datasetCode}: HTTP ${res.status}`);
+  const json = await res.json();
+  const obs = json.dataset.data
+    .map(row => ({ date: row[0], value: parseFloat(row[1]) }))
+    .filter(o => !isNaN(o.value));
+  _cache[cacheKey] = obs;
+  return obs;
+}
+
+// Compute YoY % change using the last value vs the value ~52 obs ago
+function calcYoY(obs) {
+  if (obs.length < 2) return null;
+  const now = obs[obs.length - 1].value;
+  const prior = obs[0].value;
+  return ((now - prior) / Math.abs(prior)) * 100;
+}
+
+// Format a raw number given a series spec
+function formatValue(raw, spec) {
+  if (raw == null || isNaN(raw)) return "—";
+  let v = raw;
+  if (spec.multBps) v = raw * 100; // yield curve: decimal → bps
+  v = v / (spec.div === 1 ? 1 : 1); // div already applied upstream
+  if (spec.fmt === "$T") return `$${(raw / 1e6).toFixed(spec.decimals)}T`;
+  if (spec.fmt === "$B") return `$${(raw / 1e3).toFixed(spec.decimals)}B`;
+  if (spec.fmt === "K")  return `${(raw / 1e3).toFixed(spec.decimals)}K`;
+  if (spec.fmt === "bps" && spec.multBps) return `${Math.round(raw * 100)} bps`;
+  if (spec.fmt === "bps") return `${raw.toFixed(spec.decimals)} bps`;
+  if (spec.fmt === "%")  return `${raw.toFixed(spec.decimals)}%`;
+  return raw.toFixed(spec.decimals);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  STYLES  ██
+// ═══════════════════════════════════════════════════════════════════════════════
+const styles = `
+  :root {
+    --bg:#060810; --surface:#0d1120; --surface2:#131929;
+    --border:#1e2a42; --gold:#c9a84c; --gold-dim:#7a6232;
+    --blue:#3b82f6; --cyan:#22d3ee; --green:#22c55e;
+    --red:#ef4444; --amber:#f59e0b; --muted:#4a5568;
+    --text:#e2e8f0; --text-dim:#8896b3;
+    --mono:'Share Tech Mono', monospace;
+    --display:'Bebas Neue', sans-serif;
+    --serif:'Crimson Pro', serif;
+  }
+  .dashboard { font-family:var(--mono); background:var(--bg); color:var(--text); min-height:100vh; }
+  .header { background:linear-gradient(180deg,#0a0f1e 0%,#060810 100%); border-bottom:1px solid var(--border); padding:18px 28px; display:flex; align-items:center; justify-content:space-between; }
+  .header-left { display:flex; align-items:baseline; gap:16px; }
+  .header-title { font-family:var(--display); font-size:28px; letter-spacing:3px; color:var(--gold); text-shadow:0 0 30px rgba(201,168,76,0.3); }
+  .header-sub { font-family:var(--serif); font-style:italic; color:var(--text-dim); font-size:13px; }
+  .header-time { font-size:11px; color:var(--text-dim); text-align:right; line-height:1.8; }
+  .live-dot { display:inline-block; width:7px; height:7px; background:var(--green); border-radius:50%; margin-right:6px; animation:pulse 2s infinite; box-shadow:0 0 8px var(--green); }
+  .live-dot.fetching { background:var(--amber); box-shadow:0 0 8px var(--amber); }
+  .live-dot.error { background:var(--red); box-shadow:0 0 8px var(--red); animation:none; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  /* ── API Key Setup Banner ── */
+  .setup-banner { margin:20px 28px; padding:20px 24px; background:linear-gradient(135deg,rgba(201,168,76,0.1),rgba(201,168,76,0.04)); border:1px solid rgba(201,168,76,0.35); border-left:3px solid var(--gold); border-radius:0 6px 6px 0; }
+  .setup-title { font-family:var(--display); font-size:16px; letter-spacing:3px; color:var(--gold); margin-bottom:12px; }
+  .setup-steps { font-size:11px; color:var(--text-dim); line-height:2.2; }
+  .setup-steps a { color:var(--cyan); text-decoration:none; }
+  .setup-steps a:hover { text-decoration:underline; }
+  .setup-key-row { display:flex; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap; }
+  .setup-key-label { font-size:10px; letter-spacing:1.5px; color:var(--text-dim); text-transform:uppercase; width:140px; }
+  .setup-key-input { background:var(--surface2); border:1px solid var(--border); color:var(--text); font-family:var(--mono); font-size:11px; padding:7px 12px; border-radius:4px; width:340px; outline:none; transition:border-color 0.2s; }
+  .setup-key-input:focus { border-color:var(--gold); }
+  .setup-key-input.valid { border-color:var(--green); }
+  .setup-key-input.invalid { border-color:var(--red); }
+  .setup-btn { background:rgba(201,168,76,0.15); border:1px solid var(--gold-dim); color:var(--gold); font-family:var(--mono); font-size:11px; letter-spacing:1px; padding:8px 20px; cursor:pointer; border-radius:4px; transition:all 0.2s; white-space:nowrap; }
+  .setup-btn:hover { background:rgba(201,168,76,0.25); }
+  .setup-btn:disabled { opacity:0.4; cursor:not-allowed; }
+
+  /* ── Data Status Bar ── */
+  .status-bar { background:rgba(30,42,66,0.4); border-bottom:1px solid var(--border); padding:8px 28px; display:flex; align-items:center; gap:16px; flex-wrap:wrap; font-size:10px; }
+  .status-chip { display:flex; align-items:center; gap:5px; padding:3px 8px; border-radius:2px; border:1px solid var(--border); }
+  .status-chip.live { border-color:rgba(34,197,94,0.3); background:rgba(34,197,94,0.06); color:var(--green); }
+  .status-chip.loading { border-color:rgba(245,158,11,0.3); background:rgba(245,158,11,0.06); color:var(--amber); }
+  .status-chip.error { border-color:rgba(239,68,68,0.3); background:rgba(239,68,68,0.06); color:var(--red); }
+  .status-chip.manual { border-color:rgba(138,151,179,0.3); background:rgba(138,151,179,0.06); color:var(--text-dim); }
+  .status-dot { width:5px; height:5px; border-radius:50%; background:currentColor; }
+  .status-refresh { margin-left:auto; cursor:pointer; color:var(--text-dim); padding:3px 8px; border:1px solid var(--border); border-radius:2px; transition:all 0.2s; }
+  .status-refresh:hover { border-color:var(--gold-dim); color:var(--gold); }
+
+  /* ── Tabs ── */
+  .tabs { display:flex; background:var(--surface); border-bottom:1px solid var(--border); padding:0 28px; overflow-x:auto; }
+  .tab { padding:14px 22px; cursor:pointer; font-size:11px; letter-spacing:2px; color:var(--text-dim); border-bottom:2px solid transparent; transition:all 0.2s; display:flex; align-items:center; gap:8px; text-transform:uppercase; white-space:nowrap; }
+  .tab:hover { color:var(--text); background:rgba(255,255,255,0.03); }
+  .tab.active { color:var(--gold); border-bottom-color:var(--gold); background:rgba(201,168,76,0.05); }
+
+  /* ── Section Headers ── */
+  .section-header { padding:20px 28px 10px; display:flex; align-items:baseline; gap:12px; border-bottom:1px solid rgba(30,42,66,0.5); }
+  .section-title { font-family:var(--display); font-size:18px; letter-spacing:3px; color:var(--gold-dim); }
+  .section-desc { font-family:var(--serif); font-style:italic; font-size:12px; color:var(--text-dim); }
+  .framework-banner { margin:16px 28px 0; padding:12px 16px; background:linear-gradient(135deg,rgba(201,168,76,0.08),rgba(201,168,76,0.03)); border:1px solid rgba(201,168,76,0.2); border-left:3px solid var(--gold); border-radius:0 4px 4px 0; font-family:var(--serif); font-style:italic; font-size:13px; color:#b8a87e; line-height:1.6; }
+  .framework-attr { font-style:normal; font-size:11px; color:var(--gold-dim); margin-top:4px; letter-spacing:1px; }
+
+  /* ── Cards ── */
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; padding:16px 28px 24px; }
+  .grid-wide { grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:16px; transition:border-color 0.2s,background 0.2s; position:relative; overflow:hidden; }
+  .card::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; }
+  .card.bullish::before { background:linear-gradient(90deg,var(--green),transparent); }
+  .card.bearish::before { background:linear-gradient(90deg,var(--red),transparent); }
+  .card.neutral::before { background:linear-gradient(90deg,var(--amber),transparent); }
+  .card.watch::before { background:linear-gradient(90deg,var(--cyan),transparent); }
+  .card:hover { border-color:rgba(201,168,76,0.3); background:var(--surface2); }
+  .card-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px; }
+  .card-name { font-size:10px; letter-spacing:1.5px; color:var(--text-dim); text-transform:uppercase; line-height:1.4; flex:1; padding-right:8px; }
+  .signal-badge { font-size:9px; letter-spacing:1px; padding:3px 8px; border-radius:2px; text-transform:uppercase; font-weight:bold; white-space:nowrap; }
+  .signal-badge.bullish { background:rgba(34,197,94,0.15); color:var(--green); border:1px solid rgba(34,197,94,0.3); }
+  .signal-badge.bearish { background:rgba(239,68,68,0.15); color:var(--red); border:1px solid rgba(239,68,68,0.3); }
+  .signal-badge.neutral { background:rgba(245,158,11,0.15); color:var(--amber); border:1px solid rgba(245,158,11,0.3); }
+  .signal-badge.watch { background:rgba(34,211,238,0.1); color:var(--cyan); border:1px solid rgba(34,211,238,0.25); }
+  .signal-badge.loading { background:rgba(138,151,179,0.1); color:var(--text-dim); border:1px solid rgba(138,151,179,0.2); }
+  .card-value { font-size:26px; color:var(--text); line-height:1; margin-bottom:4px; letter-spacing:-0.5px; }
+  .card-value.loading { color:var(--muted); font-size:18px; }
+  .card-change { font-size:12px; margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+  .up { color:var(--green); } .down { color:var(--red); } .flat { color:var(--amber); }
+  .lbl { color:var(--text-dim); font-size:10px; }
+  .sparkline { height:72px; margin-bottom:10px; position:relative; }
+  .sparkline svg { width:100%; height:100%; overflow:visible; }
+  .card-desc { font-family:var(--serif); font-size:11.5px; color:var(--text-dim); line-height:1.5; border-top:1px solid var(--border); padding-top:8px; }
+  .card-source { font-size:9px; color:var(--muted); margin-top:6px; letter-spacing:0.5px; }
+  .live-badge { font-size:8px; color:var(--green); border:1px solid rgba(34,197,94,0.25); padding:1px 5px; border-radius:2px; margin-left:4px; letter-spacing:0.5px; }
+  .manual-badge { font-size:8px; color:var(--text-dim); border:1px solid var(--border); padding:1px 5px; border-radius:2px; margin-left:4px; letter-spacing:0.5px; }
+  .subsection-label { font-family:var(--display); font-size:13px; letter-spacing:3px; padding:12px 28px 4px; opacity:0.85; }
+
+  /* ── Trifecta / Gauge / Legend (unchanged) ── */
+  .trifecta-wrap { margin:16px 28px 0; display:grid; grid-template-columns:180px 1fr; gap:16px; align-items:start; }
+  .trifecta-score-box { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:20px; text-align:center; }
+  .trifecta-score-label { font-size:9px; letter-spacing:2px; color:var(--text-dim); text-transform:uppercase; margin-bottom:8px; }
+  .trifecta-score-number { font-family:var(--display); font-size:68px; line-height:1; letter-spacing:4px; }
+  .trifecta-score-max { font-size:20px; color:var(--text-dim); }
+  .trifecta-verdict { font-family:var(--serif); font-size:12px; font-style:italic; margin-top:8px; color:var(--text-dim); }
+  .trifecta-pillars { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .pillar-card { background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:14px; }
+  .pillar-title { font-size:9px; letter-spacing:2px; text-transform:uppercase; margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+  .pillar-item { display:flex; justify-content:space-between; align-items:center; padding:5px 0; border-bottom:1px solid rgba(30,42,66,0.5); font-size:10px; color:var(--text-dim); }
+  .pillar-item:last-child { border-bottom:none; }
+  .pillar-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
+  .tech-gauges { padding:0 28px; display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:12px; margin-top:12px; }
+  .gauge-card { background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:16px; }
+  .gauge-title { font-size:10px; letter-spacing:1.5px; text-transform:uppercase; color:var(--text-dim); margin-bottom:10px; line-height:1.4; }
+  .gauge-value-big { font-size:24px; color:var(--text); margin-bottom:8px; }
+  .gauge-bar-track { height:6px; background:rgba(255,255,255,0.07); border-radius:3px; overflow:hidden; margin-bottom:4px; }
+  .gauge-bar-fill { height:100%; border-radius:3px; transition:width 0.6s; }
+  .gauge-labels { display:flex; justify-content:space-between; font-size:8px; color:var(--muted); }
+  .gauge-desc { font-family:var(--serif); font-size:11px; color:var(--text-dim); line-height:1.5; margin-top:8px; font-style:italic; border-top:1px solid var(--border); padding-top:8px; }
+  .legend-header { padding:16px 28px 8px; border-top:1px solid var(--border); margin-top:8px; }
+  .legend-title { font-family:var(--display); font-size:14px; letter-spacing:3px; color:var(--cyan); }
+  .legend-sub { font-family:var(--serif); font-style:italic; font-size:12px; color:var(--text-dim); margin-top:2px; }
+
+  /* ── TSMC Chart ── */
+  .rev-chart-wrap { margin:12px 28px; background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:20px; }
+  .rev-chart-header { display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:16px; }
+  .rev-chart-title { font-family:var(--display); font-size:15px; letter-spacing:3px; }
+  .rev-chart-sub { font-family:var(--serif); font-style:italic; font-size:11px; color:var(--text-dim); margin-top:3px; }
+  .rev-svg-wrap { width:100%; }
+  .rev-footer { display:flex; align-items:center; gap:16px; margin-top:12px; padding-top:10px; border-top:1px solid var(--border); flex-wrap:wrap; }
+  .rev-legend-dot { width:10px; height:10px; border-radius:2px; display:inline-block; margin-right:5px; }
+
+  /* ── Stock Overview ── */
+  .overview-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; padding:12px 28px; }
+  .overview-card { background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:18px; text-align:center; }
+  .overview-label { font-size:9px; letter-spacing:2px; color:var(--text-dim); text-transform:uppercase; margin-bottom:8px; }
+  .stock-thesis { margin:0 28px 4px; padding:10px 14px; background:rgba(59,130,246,0.05); border-left:2px solid var(--blue); font-family:var(--serif); font-size:12px; color:var(--text-dim); font-style:italic; }
+  .disclaimer { padding:12px 28px 20px; font-family:var(--serif); font-size:11px; color:var(--muted); font-style:italic; border-top:1px solid var(--border); margin-top:8px; }
+
+  /* ── VIX Gauge special ── */
+  .vix-live-note { font-size:9px; color:var(--green); margin-left:8px; }
+
+  /* ── Error / Loading states ── */
+  .error-box { margin:20px 28px; padding:14px 18px; background:rgba(239,68,68,0.07); border:1px solid rgba(239,68,68,0.25); border-radius:4px; font-size:11px; color:var(--red); }
+  .loading-shimmer { display:inline-block; width:80px; height:14px; background:linear-gradient(90deg,var(--surface),var(--surface2),var(--surface)); background-size:200% 100%; animation:shimmer 1.5s infinite; border-radius:3px; }
+  @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+`;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  SPARKLINE (unchanged from original)  ██
+// ═══════════════════════════════════════════════════════════════════════════════
+function Sparkline({ data, color, labels }) {
+  const [tipIdx, setTipIdx] = useState(null);
+  const W = 260, H = 56;
+  const mL = 38, mR = 8, mT = 6, mB = 18;
+  const cW = W - mL - mR, cH = H - mT - mB;
+  const mn = Math.min(...data), mx = Math.max(...data);
+  const rng = mx - mn || 1;
+  const fmt = v => {
+    const abs = Math.abs(v);
+    if (abs >= 1000) return (v/1000).toFixed(1).replace(/\.0$/,"")+"k";
+    if (abs >= 1)    return Number.isInteger(v) ? String(v) : v.toFixed(1);
+    return v.toFixed(2);
+  };
+  const xOf = i => mL + (i / (data.length - 1)) * cW;
+  const yOf = v => mT + cH - ((v - mn) / rng) * cH;
+  const pts = data.map((v,i) => [xOf(i), yOf(v)]);
+  const linePath = pts.map((p,i) => `${i===0?"M":"L"}${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(" ");
+  const areaPath = `${linePath} L${pts[pts.length-1][0].toFixed(1)} ${mT+cH} L${mL} ${mT+cH} Z`;
+  const yGridVals = [mn, (mn+mx)/2, mx];
+  const uid = `sp_${color.replace(/[^a-z0-9]/gi,"")}_${Math.round(mn*10+mx*7)}`;
+  const xLabelIdxs = [0, Math.floor((data.length-1)/2), data.length-1];
+  const hitW = cW / (data.length - 1);
+  const tip = tipIdx != null ? { x: pts[tipIdx][0], y: pts[tipIdx][1], v: data[tipIdx], i: tipIdx } : null;
+  return (
+    <div className="sparkline">
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" onMouseLeave={() => setTipIdx(null)}>
+        <defs>
+          <linearGradient id={uid} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity="0.3"/>
+            <stop offset="100%" stopColor={color} stopOpacity="0"/>
+          </linearGradient>
+        </defs>
+        {yGridVals.map((v,i) => {
+          const y = yOf(v);
+          return (
+            <g key={i}>
+              <line x1={mL} x2={mL+cW} y1={y} y2={y} stroke="#1e2a42" strokeWidth={i===0?1.2:0.7} strokeDasharray={i===0?"":"3 3"}/>
+              <text x={mL-3} y={y+3.5} textAnchor="end" fill="#4a5568" fontSize="8.5" fontFamily="'Share Tech Mono',monospace">{fmt(v)}</text>
+            </g>
+          );
+        })}
+        <path d={areaPath} fill={`url(#${uid})`} clipPath={`url(#clip_${uid})`}/>
+        <clipPath id={`clip_${uid}`}><rect x={mL} y={mT} width={cW} height={cH}/></clipPath>
+        <path d={linePath} stroke={color} strokeWidth="1.5" fill="none"/>
+        {xLabelIdxs.map(i => {
+          const lbl = labels ? labels[i] : `p${i+1}`;
+          const x = xOf(i);
+          const anchor = i===0 ? "start" : i===data.length-1 ? "end" : "middle";
+          const cx = i===0 ? mL : i===data.length-1 ? mL+cW : x;
+          return <text key={i} x={cx} y={H-2} textAnchor={anchor} fill="#4a5568" fontSize="8.5" fontFamily="'Share Tech Mono',monospace">{lbl}</text>;
+        })}
+        {data.map((v,i) => {
+          const x = xOf(i) - hitW/2;
+          return <rect key={i} x={x} y={mT} width={hitW} height={cH} fill="transparent" onMouseEnter={() => setTipIdx(i)}/>;
+        })}
+        {tip && (
+          <g>
+            <line x1={tip.x} x2={tip.x} y1={mT} y2={mT+cH} stroke={color} strokeWidth="0.8" strokeDasharray="3 2" opacity="0.5"/>
+            <circle cx={tip.x} cy={tip.y} r="3" fill={color} stroke="#060810" strokeWidth="1.5"/>
+            {(() => {
+              const tw = 60, th = 20;
+              const tx = tip.x + 6 + tw > W ? tip.x - tw - 6 : tip.x + 6;
+              const ty = Math.max(mT+2, tip.y - 10);
+              return (
+                <g>
+                  <rect x={tx} y={ty} width={tw} height={th} rx="3" fill="#0d1120" stroke="#1e2a42" strokeWidth="1"/>
+                  <text x={tx+5} y={ty+13} fill={color} fontSize="9.5" fontFamily="'Share Tech Mono',monospace">{fmt(tip.v)}</text>
+                </g>
+              );
+            })()}
+          </g>
+        )}
+        {!tip && <circle cx={pts[pts.length-1][0]} cy={pts[pts.length-1][1]} r="2.5" fill={color}/>}
+      </svg>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  MetricCard — live-aware  ██
+// ═══════════════════════════════════════════════════════════════════════════════
+function MetricCard({ name, value, unit="", change, changePeriod, signal, desc, source, sparkData, sparkLabels, isLive, isLoading, liveError }) {
+  const sc = {bullish:"#22c55e",bearish:"#ef4444",neutral:"#f59e0b",watch:"#22d3ee"}[signal]||"#888";
+  const chStr = String(change||"");
+  const isUp = chStr.startsWith("+") || (typeof change==="number"&&change>0);
+  const isDown = chStr.startsWith("-") || (typeof change==="number"&&change<0);
+  const defaultLabels = sparkData ? sparkData.map((_,i,a) => {
+    if (i===0) return `${a.length-1}m ago`;
+    if (i===Math.floor((a.length-1)/2)) return "";
+    if (i===a.length-1) return "now";
+    return "";
+  }) : null;
+  const displaySignal = isLoading ? "loading" : signal;
+  return (
+    <div className={`card ${displaySignal}`}>
+      <div className="card-header">
+        <div className="card-name">
+          {name}
+          {isLive && !isLoading && !liveError && <span className="live-badge">LIVE</span>}
+          {!isLive && <span className="manual-badge">MANUAL</span>}
+        </div>
+        <div className={`signal-badge ${displaySignal}`}>{isLoading ? "…" : signal}</div>
+      </div>
+      <div className={`card-value ${isLoading ? "loading" : ""}`}>
+        {isLoading ? <span className="loading-shimmer"/> : liveError ? <span style={{fontSize:"13px",color:"var(--red)"}}>fetch error</span> : value}
+        {!isLoading && !liveError && <span style={{fontSize:"13px",color:"var(--text-dim)",marginLeft:"4px"}}>{unit}</span>}
+      </div>
+      {change!=null&&!isLoading&&(
+        <div className="card-change">
+          <span className={isDown?"down":isUp?"up":"flat"}>{change}</span>
+          {changePeriod&&<span className="lbl">{changePeriod}</span>}
+        </div>
+      )}
+      {sparkData&&sparkData.length>1&&<Sparkline data={sparkData} color={sc} labels={sparkLabels||defaultLabels}/>}
+      <div className="card-desc">{desc}</div>
+      {source&&<div className="card-source">↗ {source}</div>}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  STATIC / MANUAL DATA  ██
+// (indicators without a free browser API — update manually after weekly review)
+// ═══════════════════════════════════════════════════════════════════════════════
+const TSMC_MONTHLY_REV = [
+  {month:"Jan '24",twdB:215.7,usdB:6.8,yoy:"+7.9%",era:"2024"},
+  {month:"Feb '24",twdB:197.9,usdB:6.2,yoy:"+11.3%",era:"2024"},
+  {month:"Mar '24",twdB:195.2,usdB:6.1,yoy:"+34.3%",era:"2024"},
+  {month:"Apr '24",twdB:236.0,usdB:7.4,yoy:"+59.6%",era:"2024"},
+  {month:"May '24",twdB:229.6,usdB:7.2,yoy:"+32.1%",era:"2024"},
+  {month:"Jun '24",twdB:207.9,usdB:6.5,yoy:"+32.9%",era:"2024"},
+  {month:"Jul '24",twdB:256.9,usdB:8.0,yoy:"+44.7%",era:"2024"},
+  {month:"Aug '24",twdB:250.9,usdB:7.9,yoy:"+33.0%",era:"2024"},
+  {month:"Sep '24",twdB:251.9,usdB:7.9,yoy:"+39.5%",era:"2024"},
+  {month:"Oct '24",twdB:314.2,usdB:9.8,yoy:"+29.2%",era:"2024"},
+  {month:"Nov '24",twdB:276.0,usdB:8.6,yoy:"+34.2%",era:"2024"},
+  {month:"Dec '24",twdB:278.2,usdB:8.7,yoy:"+57.8%",era:"2024"},
+  {month:"Jan '25",twdB:293.0,usdB:9.0,yoy:"+35.9%",era:"2025"},
+  {month:"Feb '25",twdB:260.0,usdB:7.9,yoy:"+31.4%",era:"2025"},
+  {month:"Mar '25",twdB:310.0,usdB:9.5,yoy:"+58.8%",era:"2025"},
+  {month:"Apr '25",twdB:296.0,usdB:9.1,yoy:"+25.4%",era:"2025"},
+  {month:"May '25",twdB:320.5,usdB:9.9,yoy:"+39.6%",era:"2025"},
+  {month:"Jun '25",twdB:307.9,usdB:9.5,yoy:"+48.1%",era:"2025"},
+  {month:"Jul '25",twdB:331.9,usdB:10.2,yoy:"+29.2%",era:"2025"},
+  {month:"Aug '25",twdB:350.2,usdB:10.8,yoy:"+39.6%",era:"2025"},
+  {month:"Sep '25",twdB:307.8,usdB:9.5,yoy:"+22.2%",era:"2025"},
+  {month:"Oct '25",twdB:367.5,usdB:11.3,yoy:"+17.0%",era:"2025"},
+  {month:"Nov '25",twdB:343.6,usdB:10.6,yoy:"+24.5%",era:"2025"},
+  {month:"Dec '25",twdB:335.0,usdB:10.3,yoy:"+20.4%",era:"2025"},
+  {month:"Jan '26",twdB:401.3,usdB:12.7,yoy:"+36.8%",era:"2026"},
+  // ── ADD Feb '26 here when TSMC IR releases ~March 10 ──
+  // {month:"Feb '26",twdB:???,usdB:???,yoy:"??%",era:"2026"},
+];
+
+// Static fallback sparklines (used until live data loads, or for manual indicators)
+const STATIC_SPARK = {
+  FED_BALANCE:  [8.9,8.5,8.1,7.7,7.4,7.1,6.97],
+  RRP:          [2200,1800,1400,980,600,500,438],
+  TGA:          [400,350,500,620,780,700,812],
+  M2_YOY:       [-3.8,-2.4,-0.6,0.8,2.1,3.2,3.9],
+  NFCI:         [0.3,0.1,-0.1,-0.28,-0.42,-0.50,-0.54],
+  HY_SPREADS:   [450,390,360,330,315,310,301],
+  DXY:          [106,105.5,105,104.8,104.2,104,103.8],
+  CI_LOANS:     [9,7,4.5,3,2.5,2,1.8],
+  SOFR:         [12,10,8,7,5,5,4],
+  YIELD_CURVE:  [-108,-80,-52,-28,-10,12,28],
+  JOBLESS:      [195,200,205,210,213,216,218],
+  NAHB:         [38,39,40,41,42,43,44],
+  MICH:         [69,71,74,77,79,78,76.9],
+  VIX:          [18,16,14,13,15,14.5,14.2],
+  MOODY_BAA:    [5.6,5.5,5.45,5.42,5.40,5.38,5.35],
+  NAAIM:        [55,65,75,82,85,88,88],
+};
+
+// ── Manual indicators — update these weekly ──────────────────────────────────
+const MANUAL_INDICATORS = {
+  liquidity: [
+    {key:"M2_GLOBAL",name:"Global M2 (G5 Central Banks)",value:"$84.1T",change:"+4.2%",changePeriod:"YoY",signal:"bullish",sparkData:[76,78,79,80.5,82,83.2,84.1],desc:"Cross-border liquidity across Fed, ECB, BoJ, PBOC, BoE. PBOC easing since 2023 is a key driver. Global M2 strongly correlated with S&P 500 levels.",source:"Individual CB releases — update monthly"},
+  ],
+  macro: [
+    {key:"ISM_PMI",name:"ISM Manufacturing PMI",value:"50.3",change:"+1.2",changePeriod:"MoM",signal:"bullish",sparkData:[46.5,47.1,48.2,48.9,49.5,50.1,50.3],desc:"Just crossed 50 into expansion. New Orders sub-index (51.8) more forward-looking. Manufacturing PMI leads S&P 500 earnings by ~2 quarters.",source:"ISM — update 1st business day monthly"},
+    {key:"LEI",name:"Conference Board LEI",value:"-0.4% MoM",change:"+0.3%",changePeriod:"QoQ trend",signal:"neutral",sparkData:[-1.2,-0.9,-0.7,-0.6,-0.5,-0.4,-0.4],desc:"Composite of 10 leading indicators. Still slightly negative MoM but trend improving. The 6-month annualised rate is the key signal.",source:"Conference Board — update 3rd week monthly"},
+    {key:"BOFA",name:"BofA Card Spending (Consumer)",value:"+2.1% YoY",change:"-0.8%",changePeriod:"vs. Q3",signal:"neutral",sparkData:[5.8,4.5,3.6,3.0,2.5,2.2,2.1],desc:"Real-time aggregate of 67M BofA cardholder transactions. Decelerating but positive. Services holding up; goods softening.",source:"BofA Institute — update monthly"},
+    {key:"ELECTRICITY",name:"Electricity Consumption (US, YoY)",value:"+3.8% YoY",change:"+0.6%",changePeriod:"MoM",signal:"bullish",sparkData:[0.8,1.2,1.5,2.0,2.8,3.3,3.8],desc:"Accelerating sharply — driven by AI datacentre buildout and onshoring. Diverging from soft survey data. Reliable coincident economic indicator.",source:"EIA Electric Power Monthly"},
+    {key:"CASS",name:"Cass Freight Index (Shipments)",value:"1.31",change:"+2.4%",changePeriod:"MoM",signal:"bullish",sparkData:[1.18,1.20,1.22,1.25,1.27,1.29,1.31],desc:"Volume of North American freight shipments — real-economy proxy. Recovering from 2023 freight recession. Leads industrial production by 1–2 months.",source:"Cass Information Systems — update monthly"},
+    {key:"PHILLY",name:"Philadelphia Fed Capex Survey",value:"+14.2",change:"+3.8",changePeriod:"QoQ",signal:"bullish",sparkData:[-8,-3,2,6,9,12,14.2],desc:"Forward-looking capex intentions — moving strongly positive, consistent with AI/data infrastructure investment wave.",source:"Philadelphia Fed — update quarterly"},
+    {key:"SIA",name:"SIA Semiconductor Billings (Global)",value:"$54.9B",change:"+17.1%",changePeriod:"YoY",signal:"bullish",sparkData:[39,41,44,46,49,52,54.9],desc:"Monthly global semiconductor sales — technology cycle bellwether. Double-digit YoY growth driven by AI/HBM demand. Leads tech earnings by ~2 quarters.",source:"SIA — update monthly"},
+  ],
+  technicals: {
+    putcall:   {title:"Put/Call Ratio (10-day avg)",value:"0.73",pct:35,color:"#f59e0b",labels:["Fear >1.2","Elevated >1.0","Normal 0.8–1.0","Complacent <0.8"],desc:"Below 0.80 = speculative excess. Macro Ops flags readings below 0.70 as a near-term pullback warning. Currently in caution zone. Update weekly from CBOE."},
+    aaii:      {title:"AAII Bull-Bear Spread",value:"+22%",pct:68,color:"#f59e0b",labels:["Max Bear -40%","Neutral 0%","Bullish +20%","Extreme +40%"],desc:"Contrarian indicator. At +22%, approaching crowded territory. Historically, readings above +30% have been followed by flat-to-negative 3-month returns. Update every Thursday from aaii.com."},
+    naaim:     {title:"NAAIM Active Manager Exposure",value:"88",pct:44,color:"#ef4444",labels:["Max Short 0","Neutral 50","Fully Long 100","Leveraged 200"],desc:"Active managers' equity exposure. Readings above 90 have historically coincided with short-term market tops. Extreme low readings (<40) signal contrarian buy. Update every Thursday from naaim.org."},
+    mcclellan: {title:"NYSE McClellan Summation Index",value:"+820",pct:70,color:"#22c55e",labels:["Bear <-500","Neutral -500/0","Bull 0/+1000","Extreme >+1500"],desc:"Cumulative breadth momentum. Positive readings above +500 confirm bull market breadth. A turn from negative to positive historically marks high-probability buying signals. Update weekly from stockcharts.com ($NYSI)."},
+    nyad:      {title:"NYSE Advance-Decline Line",value:"New 52-wk High",pct:95,color:"#22c55e",labels:["Collapsing","Diverging","Confirming","New High"],desc:"A/D Line at new highs confirms the rally is broadly based — not just mega-cap driven. A divergence (A/D declining while SPX rises) is one of the most reliable early warning signals. Update weekly from stockcharts.com ($NYAD)."},
+  },
+  legend: [
+    {name:"Trend Fragility Score — Macro Ops",value:"62%",signal:"neutral",sparkData:[28,35,42,50,55,59,62],desc:"Composite of sentiment + positioning indicators. >95% = conditional sell signal. Currently 62% — elevated but well below threshold. Rising trend warrants monitoring.",source:"Macro Ops Trifecta Report — update weekly"},
+    {name:"SQN Market Regime — Macro Ops",value:"Bull Quiet",signal:"bullish",sparkData:[1,1,2,2,3,3,3],desc:"5-regime system: Bear Volatile → Bear Quiet → Neutral → Bull Quiet → Bull Volatile. Bull Quiet = trending up with low vol — historically the best risk/reward regime for long equity exposure.",source:"Macro Ops SQN Framework — update weekly"},
+    {name:"Sector Rotation: Cyclicals vs. Defensives",value:"Cyclicals Leading",signal:"bullish",sparkData:[0.85,0.88,0.92,0.95,1.00,1.04,1.08],desc:"Livermore and Druckenmiller both emphasise sector rotation as a leading market signal. Cyclicals outperforming defensives = healthy bull market.",source:"SPDR Sector ETF relative performance (XLY/XLP, XLK/XLU) — update weekly"},
+    {name:"New 52-Week Highs vs. Lows — Livermore",value:"318 vs. 24",signal:"bullish",sparkData:[60,90,120,180,220,280,318],desc:"Livermore: 'A bull market is confirmed when stocks are hitting new highs, not new lows.' Current 318 new highs vs. 24 new lows is strongly confirming.",source:"NYSE Daily Market Statistics — update weekly"},
+    {name:"Small Cap / Large Cap Ratio (IWM/SPY)",value:"0.478",signal:"neutral",sparkData:[0.52,0.50,0.49,0.488,0.483,0.480,0.478],desc:"Small caps underperforming — a classic sign of late-cycle caution. Healthy bull markets typically see small caps confirming. A sustained break above 0.50 would be constructive.",source:"IWM:SPY ratio — update weekly"},
+    {name:"HY Credit Spread Trend — Kovner / Druckenmiller",value:"Tightening",signal:"bullish",sparkData:[520,480,440,390,350,320,301],desc:"Kovner and Druckenmiller both place credit spreads at the top of their market hierarchy. Tightening spreads = credit leading equities higher.",source:"ICE BofA HY OAS Index — see Liquidity tab for live feed"},
+  ],
+};
+
+// ── Trifecta (manual / interpretive — update weekly) ─────────────────────────
+const TRIFECTA = {
+  score:4, max:9,
+  verdict:"Moderately Bullish — Tape & Breadth constructive, Sentiment crowded",
+  regime:"BULL QUIET", regimeColor:"#22c55e",
+  pillars:[
+    {name:"TAPE / TREND",icon:"◈",score:2,max:3,color:"#22c55e",items:[
+      {label:"SPX vs 200-day SMA",value:"+8.4% above",sig:"bullish"},
+      {label:"SPX vs 50-day SMA",value:"+3.1% above",sig:"bullish"},
+      {label:"Trend Fragility Score",value:"62% — elevated",sig:"neutral"},
+    ]},
+    {name:"BREADTH",icon:"◉",score:2,max:3,color:"#3b82f6",items:[
+      {label:"% SPX > 200-day SMA",value:"68%",sig:"bullish"},
+      {label:"McClellan Summation",value:"+820 (positive)",sig:"bullish"},
+      {label:"NYSE A/D Line",value:"New 52-wk high",sig:"bullish"},
+    ]},
+    {name:"SENTIMENT / POSITIONING",icon:"◎",score:0,max:3,color:"#f59e0b",items:[
+      {label:"AAII Bull-Bear Spread",value:"+22% (crowded)",sig:"bearish"},
+      {label:"NAAIM Exposure Index",value:"88 — near max",sig:"bearish"},
+      {label:"CNN Fear & Greed",value:"72 — Greed",sig:"neutral"},
+    ]}
+  ]
+};
+
+// ── Stock data (manual — update periodically) ────────────────────────────────
+const STOCK_DATA = {
+  TSM:{
+    name:"Taiwan Semiconductor Mfg Co.",ticker:"TSM",color:"#3b82f6",
+    price:"$181.40",change:"+2.3%",
+    thesis:"TSMC is the toll booth of the AI infrastructure buildout — sole manufacturer of leading-edge chips for Apple, Nvidia, AMD, and Qualcomm at 3nm/2nm. Leading indicators focus on wafer demand, AI accelerator capacity allocation, and geopolitical risk.",
+    indicators:[
+      {name:"SEMI Book-to-Bill Ratio",value:"1.18",signal:"bullish",sparkData:[0.82,0.88,0.95,1.02,1.08,1.14,1.18],desc:">1.0 signals rising demand for fab capacity — a 2-quarter leading indicator for TSMC revenue.",source:"SEMI.org (monthly)"},
+      {name:"CoWoS Capacity (000 wspm)",value:"42K",change:"+180%",changePeriod:"YoY",signal:"bullish",sparkData:[15,20,25,30,35,39,42],desc:"Each incremental 1K wspm supports ~$100–120M in quarterly revenue. Expansion pace is the key AI GPU volume driver.",source:"TSMC Earnings / DigiTimes"},
+      {name:"Apple iPhone (Design Wins)",value:"iPhone 17 Secured",signal:"neutral",sparkData:[18,18,19,19,20,20,21],desc:"Apple ~25% of TSMC revenue. iPhone 17 on 3nm secured. Seasonal ramp visibility for H2 each year.",source:"Ming-Chi Kuo, DigiTimes"},
+      {name:"HBM DRAM Supply Tightness",value:"Tight",signal:"bullish",sparkData:[30,40,55,65,78,88,92],desc:"HBM supply constraint sustains premium packaging environment for TSMC CoWoS — both required for Nvidia GPU modules.",source:"SK Hynix IR, Samsung Semiconductor"},
+      {name:"TSMC Arizona Fab Ramp",value:"4nm Online",signal:"watch",sparkData:[0,0,10,25,40,60,75],desc:"Arizona N4 now in production. Near-term margin dilution ~2–3% ASP premium partially offset by IRA subsidies.",source:"TSMC IR, CHIPS Act filings"},
+      {name:"2nm N2 Node Ramp Readiness",value:"H2 2025E",signal:"bullish",sparkData:[5,10,20,35,55,75,90],desc:"N2 on track for volume production H2 2025. Yield ramp will drive a fresh ASP premium cycle — next major revenue leg.",source:"TSMC IR, Semianalysis"},
+    ]
+  },
+  GOOGL:{
+    name:"Alphabet Inc.",ticker:"GOOGL",color:"#22c55e",
+    price:"$174.50",change:"+0.8%",
+    thesis:"Google's valuation is primarily driven by Search + YouTube ad revenue (70% of sales), with Gemini AI and Google Cloud as growth optionality. Leading indicators focus on digital ad market health, AI search transition risk, and cloud inflection.",
+    indicators:[
+      {name:"Digital Ad Market Growth (eMarketer)",value:"+12.3% YoY",signal:"bullish",sparkData:[4,6,8,9.5,11,11.8,12.3],desc:"Digital advertising market re-accelerating. Rising search CPCs signal advertiser confidence recovering.",source:"eMarketer / IAB (quarterly)"},
+      {name:"US Digital Ad Spend (Comscore)",value:"+8.7% YoY",signal:"bullish",sparkData:[3.5,5,6.5,7.5,8,8.4,8.7],desc:"Brands typically commit ad budgets 6–8 weeks ahead. Rising trend precedes Google Search revenue growth.",source:"Comscore (monthly)"},
+      {name:"Google Cloud ARR Growth",value:"+28% YoY",signal:"bullish",sparkData:[22,23,25,26.5,27.3,27.8,28],desc:"GCP narrowing gap with AWS/Azure. Enterprise AI (Vertex AI) driving accelerating commitments.",source:"Alphabet IR (quarterly)"},
+      {name:"AI Overview Click-Through Impact",value:"Est. -8% organic",signal:"watch",sparkData:[-3,-4,-6,-7,-8,-8,-8],desc:"Key risk: if AI Overviews reduce Search RPM. Management guidance suggests monetisation on par with traditional search.",source:"SparkToro, SimilarWeb, industry checks"},
+      {name:"YouTube CTV Ad Revenue Growth",value:"+19% YoY",signal:"bullish",sparkData:[8,11,13,15,17,18.2,19],desc:"Connected TV fastest-growing YouTube segment. Upfront ad commitments are 6-month leading revenue indicator.",source:"Alphabet IR, MediaRadar"},
+      {name:"Waymo Robotaxi Expansion",value:"7 Cities",signal:"watch",sparkData:[1,1,2,3,4,5,7],desc:"Long-dated optionality — $50–100B potential TAM not in current valuation. New city launches are positive catalysts.",source:"Waymo press releases"},
+    ]
+  },
+  NVDA:{
+    name:"NVIDIA Corporation",ticker:"NVDA",color:"#f59e0b",
+    price:"$875.40",change:"+1.9%",
+    thesis:"Nvidia's near-term revenue is driven overwhelmingly by hyperscaler AI GPU capex (H100/H200/Blackwell). Leading indicators focus on hyperscaler capex guidance, GB200 NVL rack demand, and demand cliff risks from ROI scrutiny.",
+    indicators:[
+      {name:"Hyperscaler Capex Guidance (Big 4)",value:"$320B+ 2025E",change:"+42%",changePeriod:"YoY",signal:"bullish",sparkData:[180,200,220,250,280,300,320],desc:"Meta, Microsoft, Amazon, Google combined AI/cloud capex. Each $10B of hyperscaler AI capex ~$4–5B of Nvidia GPU orders with 6–9 month lead time.",source:"Earnings calls (META, MSFT, AMZN, GOOG)"},
+      {name:"Blackwell (GB200) Lead Times",value:"12–16 weeks",signal:"bullish",sparkData:[52,48,40,32,24,18,14],desc:"Lead time compression signals supply normalisation. Strong demand keeps above pre-AI baseline (4–6 weeks).",source:"Supply chain checks, Semianalysis"},
+      {name:"TSMC CoWoS Allocation to Nvidia",value:"~65% of CoWoS",signal:"bullish",sparkData:[55,58,60,62,64,65,65],desc:"Nvidia commands majority of TSMC's CoWoS. CoWoS capacity expansion directly translates to Nvidia revenue upside.",source:"TSMC earnings, DigiTimes"},
+      {name:"MLPerf Inference (Nvidia Lead)",value:"H200 #1 (wide)",signal:"bullish",sparkData:[10,15,20,22,25,28,30],desc:"Dominant inference performance. Watch for AMD MI300X or Google TPU v5 gap-closing as competitive risk flag.",source:"MLCommons (biannual)"},
+      {name:"Chinese Export Restrictions Impact",value:"~$10B Rev Risk",signal:"bearish",sparkData:[2,4,6,8,9,9.5,10],desc:"BIS controls restrict H100/A100/H800 to China — historically ~20% of data centre revenue. Key tail risk to watch.",source:"BIS filings, Nvidia 10-K"},
+      {name:"Sovereign AI GPU Demand (Non-US)",value:"~$10B+ 2025E",signal:"bullish",sparkData:[1,2,3,5,7,8.5,10],desc:"Government-backed 'Sovereign AI' programmes (UAE, Japan, France, India) offsetting China restriction impact.",source:"Nvidia IR, government press releases"},
+    ]
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  SIGNAL INFERENCE  ██
+// Given a series key and its live value, determine bullish/bearish/neutral/watch
+// ═══════════════════════════════════════════════════════════════════════════════
+function inferSignal(key, value, yoyVal) {
+  if (value == null || isNaN(value)) return "neutral";
+  switch(key) {
+    case "FED_BALANCE":  return value < 7500 ? "bearish" : value > 8500 ? "bullish" : "neutral";
+    case "RRP":          return value < 200 ? "neutral" : value > 500 ? "bullish" : "watch";
+    case "TGA":          return value > 900 ? "bearish" : value < 400 ? "bullish" : "neutral";
+    case "M2_YOY":       return yoyVal != null ? (yoyVal > 5 ? "bullish" : yoyVal > 0 ? "neutral" : "bearish") : "neutral";
+    case "NFCI":         return value < -0.5 ? "bullish" : value > 0.3 ? "bearish" : "neutral";
+    case "HY_SPREADS":   return value < 300 ? "bullish" : value > 500 ? "bearish" : "neutral";
+    case "DXY":          return value < 100 ? "bullish" : value > 107 ? "bearish" : "neutral";
+    case "CI_LOANS":     return yoyVal != null ? (yoyVal > 5 ? "bullish" : yoyVal > 0 ? "neutral" : "bearish") : "neutral";
+    case "SOFR":         return value < 0.1 ? "bullish" : value > 0.2 ? "watch" : "neutral";
+    case "YIELD_CURVE":  return value > 0 ? "watch" : value < -0.5 ? "bearish" : "neutral";
+    case "JOBLESS":      return value < 215 ? "bullish" : value > 260 ? "bearish" : "neutral";
+    case "NAHB":         return value > 55 ? "bullish" : value < 40 ? "bearish" : "neutral";
+    case "MICH":         return value > 80 ? "bullish" : value < 65 ? "bearish" : "neutral";
+    case "VIX":          return value < 15 ? "watch" : value > 30 ? "bearish" : value > 20 ? "neutral" : "bullish";
+    case "MOODY_BAA":    return value < 5.2 ? "bullish" : value > 6.0 ? "bearish" : "neutral";
+    case "NAAIM":        return value > 90 ? "bearish" : value < 40 ? "bullish" : value > 75 ? "neutral" : "bullish";
+    default:             return "neutral";
+  }
+}
+
+function buildDisplayValue(key, obs) {
+  if (!obs || obs.length === 0) return { display:"—", change:null, signal:"neutral" };
+  const spec = FRED_SERIES[key] || {};
+  const latest = obs[obs.length - 1].value;
+  const prev   = obs.length > 1 ? obs[obs.length - 2].value : null;
+
+  let displayVal, yoyVal = null;
+
+  if (spec.calcYoY) {
+    yoyVal = calcYoY(obs);
+    displayVal = yoyVal != null ? `${yoyVal > 0 ? "+" : ""}${yoyVal.toFixed(1)}%` : "—";
+  } else if (spec.multBps) {
+    displayVal = `${Math.round(latest * 100)} bps`;
+  } else if (spec.fmt === "$T") {
+    displayVal = `$${(latest / 1e6).toFixed(2)}T`;
+  } else if (spec.fmt === "$B") {
+    displayVal = `$${(latest / 1e3).toFixed(0)}B`;
+  } else if (spec.fmt === "K") {
+    displayVal = `${(latest / 1e3).toFixed(0)}K`;
+  } else {
+    displayVal = latest.toFixed(spec.decimals || 1);
+  }
+
+  let changeStr = null;
+  if (prev != null) {
+    const diff = latest - prev;
+    const sign = diff >= 0 ? "+" : "";
+    if (spec.multBps)    changeStr = `${sign}${Math.round(diff * 100)} bps`;
+    else if (spec.fmt === "$T") changeStr = `${sign}${(diff / 1e6).toFixed(2)}T`;
+    else if (spec.fmt === "$B") changeStr = `${sign}${(diff / 1e3).toFixed(0)}B`;
+    else changeStr = `${sign}${diff.toFixed(spec.decimals || 1)}`;
+  }
+
+  // Build sparkline array from obs (up to 24 most recent)
+  const sparkRaw = obs.slice(-24).map(o => {
+    if (spec.multBps) return o.value * 100;
+    if (spec.fmt === "$T") return o.value / 1e6;
+    if (spec.fmt === "$B") return o.value / 1e3;
+    if (spec.fmt === "K")  return o.value / 1e3;
+    return o.value;
+  });
+
+  const sig = inferSignal(key, latest, yoyVal);
+
+  return { display: displayVal, change: changeStr, signal: sig, sparkData: sparkRaw, latestDate: obs[obs.length-1].date };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  STATIC CARD DEFINITIONS  ██
+// Desc / source / name for each FRED-backed card
+// ═══════════════════════════════════════════════════════════════════════════════
+const CARD_META = {
+  FED_BALANCE: { name:"Fed Balance Sheet (Total Assets)", unit:"", changePeriod:"WoW", desc:"QT ongoing — removing reserves from the system. Druckenmiller's #1 indicator: balance sheet expansion drives risk assets; contraction is a structural headwind.", source:"FRED: WALCL (Federal Reserve H.4.1, weekly)" },
+  RRP:         { name:"Reverse Repo (RRP) Facility", unit:"", changePeriod:"DoD", desc:"RRP drainage injected ~$2T of liquidity in 2023–24. Now near baseline — this tailwind is nearly exhausted. Stabilisation here changes the liquidity regime.", source:"FRED: RRPONTSYD (NY Fed, daily)" },
+  TGA:         { name:"Treasury General Account (TGA)", unit:"", changePeriod:"WoW", desc:"TGA rebuilding drains reserves. A falling TGA = bullish liquidity; a rising TGA = drag. Critical to monitor during debt-ceiling cycles.", source:"FRED: WTREGEN (TreasuryDirect, weekly)" },
+  M2_YOY:      { name:"M2 Money Supply (YoY)", unit:"", changePeriod:"MoM", desc:"Recovering after the 2022–23 contraction — first M2 decline in 90 years. M2 growth historically leads equity returns by 6–12 months.", source:"FRED: M2SL (Fed H.6 Release, monthly)" },
+  NFCI:        { name:"Chicago Fed NFCI", unit:"", changePeriod:"WoW", desc:"Negative = loose financial conditions. Accommodative currently. A sustained move above 0 has historically preceded equity drawdowns >10%.", source:"FRED: NFCI (Chicago Fed, weekly)" },
+  HY_SPREADS:  { name:"HY Credit Spreads (ICE BofA OAS)", unit:"bps", changePeriod:"WoW", desc:"Tightening spreads = rising risk appetite. Druckenmiller watches credit as a leading liquidity signal: HY blowout precedes equity weakness by 4–8 weeks.", source:"FRED: BAMLH0A0HYM2 (ICE BofA, daily)" },
+  DXY:         { name:"DXY Broad USD Index (DTWEXBGS)", unit:"", changePeriod:"WoW", desc:"Weakening dollar loosens global dollar liquidity — critical for EM and commodity-linked equities. Druckenmiller views DXY as a proxy for global liquidity tightness.", source:"FRED: DTWEXBGS (Federal Reserve, weekly)" },
+  CI_LOANS:    { name:"Net Bank Lending (C&I Loans YoY)", unit:"", changePeriod:"MoM", desc:"Commercial & Industrial loan growth — credit velocity in the real economy. Decelerating from post-COVID highs but stabilising. Watch for inflection.", source:"FRED: TOTCI (Federal Reserve H.8, weekly)" },
+  SOFR:        { name:"SOFR Rate", unit:"%", changePeriod:"DoD", desc:"Spread between SOFR and Fed Funds measures repo market stress. Elevated spreads (>15 bps) historically preceded funding squeezes (cf. Sept 2019). Currently contained.", source:"FRED: SOFR (NY Fed, daily)" },
+  YIELD_CURVE: { name:"2s10s Yield Curve", unit:"", changePeriod:"DoD", desc:"Re-steepening after the 2022–24 inversion. Recession risk peaks 12–18 months AFTER re-steepening from inversion — the 'bear steepener' risk window.", source:"FRED: T10Y2Y (US Treasury, daily)" },
+  JOBLESS:     { name:"Initial Jobless Claims (4-wk avg)", unit:"", changePeriod:"WoW", desc:"Slowly drifting higher from cycle lows — subtle labour market softening. Sustained move above 250K signals recession conditions.", source:"FRED: IC4WSA (DOL, Thursday weekly)" },
+  NAHB:        { name:"Housing Starts (000s ann.)", unit:"K", changePeriod:"MoM", desc:"Below-trend housing starts indicate affordability stress. Housing leads the economic cycle by 6–12 months.", source:"FRED: HOUST (Census Bureau, monthly)" },
+  MICH:        { name:"Michigan Consumer Sentiment", unit:"", changePeriod:"MoM", desc:"Moderated slightly. 1-year inflation expectations elevated vs. target, constraining Fed optionality.", source:"FRED: UMCSENT (U Michigan, monthly)" },
+  VIX:         { name:"VIX — CBOE Volatility Index", unit:"", changePeriod:"DoD", desc:"Fear gauge. Druckenmiller watches VIX regime shifts closely. A sudden spike from low VIX (e.g. 14 to 25+) often signals regime change.", source:"FRED: VIXCLS (CBOE, daily)" },
+  MOODY_BAA:   { name:"Moody's Baa Yield — Macro Ops", unit:"%", changePeriod:"WoW", desc:"Macro Ops monitors 26-week % change in Moody's Baa yields. When yields rise fast and cross the upper threshold, equity selloff typically follows within weeks.", source:"FRED: BAA (Moody's via FRED, daily)" },
+
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  GaugeCard / TrifectaPanel (unchanged structure)  ██
+// ═══════════════════════════════════════════════════════════════════════════════
+function GaugeCard({ title, value, pct, color, labels, desc, isLive, isLoading }) {
+  const barColor = pct>80?"#ef4444":pct>60?"#f59e0b":pct>30?"#22c55e":"#3b82f6";
+  return (
+    <div className="gauge-card">
+      <div className="gauge-title">
+        {title}
+        {isLive && !isLoading && <span className="live-badge" style={{marginLeft:"6px"}}>LIVE</span>}
+        {!isLive && <span className="manual-badge" style={{marginLeft:"6px"}}>MANUAL</span>}
+      </div>
+      <div className="gauge-value-big" style={{color:barColor}}>
+        {isLoading ? <span className="loading-shimmer"/> : value}
+      </div>
+      <div className="gauge-bar-track">
+        <div className="gauge-bar-fill" style={{width:`${Math.min(pct||0,100)}%`,background:`linear-gradient(90deg,${color},${barColor})`}}/>
+      </div>
+      {labels&&<div className="gauge-labels">{labels.map((l,i)=><span key={i}>{l}</span>)}</div>}
+      <div className="gauge-desc">{desc}</div>
+    </div>
+  );
+}
+
+function TrifectaPanel() {
+  const t = TRIFECTA;
+  const sc = t.score/t.max;
+  const color = sc>=0.67?"#22c55e":sc>=0.44?"#f59e0b":"#ef4444";
+  const sigColor = {bullish:"#22c55e",bearish:"#ef4444",neutral:"#f59e0b"};
+  return (
+    <div className="trifecta-wrap">
+      <div className="trifecta-score-box">
+        <div className="trifecta-score-label">Trifecta Lens Score</div>
+        <div className="trifecta-score-number" style={{color}}>
+          {t.score}<span className="trifecta-score-max">/{t.max}</span>
+        </div>
+        <div className="trifecta-verdict">{t.verdict}</div>
+        <div style={{marginTop:"12px",paddingTop:"10px",borderTop:"1px solid var(--border)"}}>
+          <div className="trifecta-score-label" style={{marginBottom:"4px"}}>SQN Regime</div>
+          <div style={{fontFamily:"var(--display)",fontSize:"18px",letterSpacing:"2px",color:t.regimeColor}}>{t.regime}</div>
+        </div>
+        <div style={{marginTop:"10px",fontSize:"9px",color:"var(--muted)",fontFamily:"var(--serif)",fontStyle:"italic"}}>Update score manually after weekly Trifecta review</div>
+      </div>
+      <div className="trifecta-pillars">
+        {t.pillars.map((p,i) => (
+          <div className="pillar-card" key={i}>
+            <div className="pillar-title" style={{color:p.color}}>
+              <span>{p.icon}</span>{p.name}
+              <span style={{marginLeft:"auto",fontFamily:"var(--display)",fontSize:"22px"}}>{p.score}/{p.max}</span>
+            </div>
+            {p.items.map((item,j) => (
+              <div className="pillar-item" key={j}>
+                <span>{item.label}</span>
+                <div style={{display:"flex",alignItems:"center",gap:"6px"}}>
+                  <span style={{color:"var(--text)",fontSize:"10px"}}>{item.value}</span>
+                  <div className="pillar-dot" style={{background:sigColor[item.sig]||"#888"}}/>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  TSMCRevenueChart (unchanged)  ██
+// ═══════════════════════════════════════════════════════════════════════════════
+function TSMCRevenueChart() {
+  const [tooltip, setTooltip] = useState(null);
+  const ltm = TSMC_MONTHLY_REV.slice(-12).reduce((s,d)=>s+d.usdB,0);
+  const latest = TSMC_MONTHLY_REV[TSMC_MONTHLY_REV.length-1];
+  const W = 860, H = 240;
+  const marginL = 52, marginR = 12, marginT = 24, marginB = 56;
+  const chartW = W - marginL - marginR;
+  const chartH = H - marginT - marginB;
+  const maxVal = Math.ceil(Math.max(...TSMC_MONTHLY_REV.map(d=>d.twdB)) / 50) * 50;
+  const n = TSMC_MONTHLY_REV.length;
+  const barW = (chartW / n) * 0.72;
+  const gap = chartW / n;
+  const yTicks = [];
+  for (let v = 0; v <= maxVal; v += 100) yTicks.push(v);
+  const yScale = v => chartH - (v / maxVal) * chartH;
+  const xCenter = i => marginL + i * gap + gap / 2;
+  const barColor = era => era==="2026" ? ["rgba(250,204,21,0.8)","rgba(250,204,21,0.4)"] :
+                          era==="2025" ? ["rgba(34,211,238,0.75)","rgba(34,211,238,0.35)"] :
+                                         ["rgba(59,130,246,0.7)","rgba(59,130,246,0.35)"];
+  const showLabel = i => i % 3 === 0 || i === n - 1;
+  return (
+    <div className="rev-chart-wrap">
+      <div className="rev-chart-header">
+        <div>
+          <div className="rev-chart-title">TSMC MONTHLY REVENUE TRACKER</div>
+          <div className="rev-chart-sub">NT$ Billions — publicly reported by TSMC IR (~10th of each month) · <span style={{color:"var(--amber)"}}>Manual update required</span></div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:"9px",letterSpacing:"1.5px",color:"var(--text-dim)",textTransform:"uppercase",marginBottom:"4px"}}>LTM Revenue (USD)</div>
+          <div style={{fontFamily:"var(--display)",fontSize:"22px",color:"var(--cyan)"}}>${ltm.toFixed(1)}B</div>
+          <div style={{fontSize:"9px",color:"var(--text-dim)",marginTop:"2px"}}>Last 12 months</div>
+        </div>
+      </div>
+      <div className="rev-svg-wrap">
+        <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{overflow:"visible"}}>
+          <defs><clipPath id="chartClip"><rect x={marginL} y={marginT} width={chartW} height={chartH}/></clipPath></defs>
+          {yTicks.map(v => {
+            const y = marginT + yScale(v);
+            return (
+              <g key={v}>
+                <line x1={marginL} x2={marginL+chartW} y1={y} y2={y} stroke={v===0?"#2a3a58":"#1e2a42"} strokeWidth={v===0?1.5:1} strokeDasharray={v===0?"":"4 4"}/>
+                <text x={marginL-6} y={y+4} textAnchor="end" fill="#8896b3" fontSize="10" fontFamily="'Share Tech Mono',monospace">{v}</text>
+              </g>
+            );
+          })}
+          <text x={10} y={marginT + chartH/2} textAnchor="middle" fill="#4a5568" fontSize="9" fontFamily="'Share Tech Mono',monospace" transform={`rotate(-90, 10, ${marginT + chartH/2})`}>NT$ BILLIONS</text>
+          {["2024","2025","2026"].map(yr => {
+            const firstIdx = TSMC_MONTHLY_REV.findIndex(d=>d.era===yr);
+            if (firstIdx < 0) return null;
+            const x = xCenter(firstIdx) - gap/2;
+            const lastIdx = TSMC_MONTHLY_REV.reduce((acc,d,i)=>d.era===yr?i:acc,-1);
+            const midX = (xCenter(firstIdx) + xCenter(lastIdx)) / 2;
+            const col = yr==="2026"?"rgba(250,204,21,0.5)":yr==="2025"?"rgba(34,211,238,0.4)":"rgba(59,130,246,0.4)";
+            return (
+              <g key={yr}>
+                {firstIdx > 0 && <line x1={x} x2={x} y1={marginT} y2={marginT+chartH+2} stroke="#2a3a58" strokeWidth="1.5" strokeDasharray="3 3"/>}
+                <text x={midX} y={marginT+chartH+46} textAnchor="middle" fill={col} fontSize="11" fontFamily="'Bebas Neue',sans-serif" letterSpacing="2">{yr}</text>
+              </g>
+            );
+          })}
+          {TSMC_MONTHLY_REV.map((d,i) => {
+            const bh = Math.max(3, (d.twdB/maxVal)*chartH);
+            const bx = xCenter(i) - barW/2;
+            const by = marginT + chartH - bh;
+            const [fill, stroke] = barColor(d.era);
+            const yoyUp = d.yoy.startsWith("+");
+            return (
+              <g key={i} onMouseEnter={() => setTooltip({i, x: xCenter(i), y: by, d})} onMouseLeave={() => setTooltip(null)} style={{cursor:"pointer"}}>
+                <rect x={bx} y={by} width={barW} height={bh} fill={fill} stroke={stroke} strokeWidth="1" rx="2"/>
+                <text x={xCenter(i)} y={by - 4} textAnchor="middle" fill={yoyUp?"#22c55e":"#ef4444"} fontSize="8" fontFamily="'Share Tech Mono',monospace">{d.yoy}</text>
+              </g>
+            );
+          })}
+          {TSMC_MONTHLY_REV.map((d,i) => showLabel(i) && (
+            <text key={i} x={xCenter(i)} y={marginT+chartH+14} textAnchor="middle" fill="#8896b3" fontSize="9" fontFamily="'Share Tech Mono',monospace">{d.month}</text>
+          ))}
+          {tooltip && (() => {
+            const {x, y, d} = tooltip;
+            const tx = Math.min(x, W - 130);
+            const ty = Math.max(marginT + 4, y - 68);
+            return (
+              <g>
+                <rect x={tx-4} y={ty-2} width={136} height={62} rx="4" fill="#0d1120" stroke="#1e2a42" strokeWidth="1"/>
+                <text x={tx+2} y={ty+13} fill="#e2e8f0" fontSize="11" fontFamily="'Bebas Neue',sans-serif" letterSpacing="1">{d.month}</text>
+                <text x={tx+2} y={ty+27} fill="#8896b3" fontSize="9" fontFamily="'Share Tech Mono',monospace">NT$ {d.twdB}B</text>
+                <text x={tx+2} y={ty+40} fill="#22d3ee" fontSize="9" fontFamily="'Share Tech Mono',monospace">USD ${d.usdB}B</text>
+                <text x={tx+2} y={ty+53} fill={d.yoy.startsWith("+")?"#22c55e":"#ef4444"} fontSize="9" fontFamily="'Share Tech Mono',monospace">YoY {d.yoy}</text>
+              </g>
+            );
+          })()}
+        </svg>
+      </div>
+      <div className="rev-footer">
+        <span style={{fontSize:"10px",color:"var(--text-dim)"}}><span className="rev-legend-dot" style={{background:"rgba(59,130,246,0.7)"}}/>2024 Actuals</span>
+        <span style={{fontSize:"10px",color:"var(--text-dim)"}}><span className="rev-legend-dot" style={{background:"rgba(34,211,238,0.75)"}}/>2025 Actuals</span>
+        <span style={{fontSize:"10px",color:"var(--text-dim)"}}><span className="rev-legend-dot" style={{background:"rgba(250,204,21,0.8)"}}/>2026 Reported</span>
+        <span style={{marginLeft:"auto",fontSize:"10px"}}>
+          Latest ({latest.month}): <span style={{color:"var(--cyan)"}}>NT${latest.twdB}B / ${latest.usdB}B USD</span>
+          <span style={{color:"#22c55e",marginLeft:"8px"}}>{latest.yoy} YoY</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  API SETUP BANNER  ██
+// ═══════════════════════════════════════════════════════════════════════════════
+function SetupBanner({ onKeysSubmit }) {
+  const [fredKey, setFredKey] = useState(FRED_API_KEY !== "YOUR_FRED_API_KEY_HERE" ? FRED_API_KEY : "");
+  const fredOk = fredKey.length === 32;
+  return (
+    <div className="setup-banner">
+      <div className="setup-title">⚡ CONNECT LIVE DATA</div>
+      <div className="setup-steps">
+        One free API key is all you need — no credit card, takes ~2 minutes:<br/>
+        <strong>FRED API Key</strong> → <a href="https://fred.stlouisfed.org/docs/api/api_key.html" target="_blank">fred.stlouisfed.org/docs/api/api_key.html</a> — covers all 15 live indicators (Fed balance sheet, liquidity, macro, VIX, yield curve, and more)<br/>
+        Paste it below and click <strong>Load Live Data</strong>. Or hardcode it at the top of this file's &lt;script&gt; block to auto-load every time.
+      </div>
+      <div className="setup-key-row">
+        <span className="setup-key-label">FRED API Key</span>
+        <input className={`setup-key-input ${fredOk?"valid":fredKey.length>0?"invalid":""}`}
+          value={fredKey} onChange={e=>setFredKey(e.target.value.trim())}
+          placeholder="e.g. abcdef0123456789abcdef0123456789 (32 chars)"/>
+        <button className="setup-btn" disabled={!fredOk} onClick={()=>onKeysSubmit(fredKey)}>
+          ⚡ Load Live Data
+        </button>
+      </div>
+      <div style={{marginTop:"10px",fontSize:"9px",color:"var(--muted)",fontFamily:"'Crimson Pro',serif",fontStyle:"italic"}}>
+        Your key is stored only in this browser session and transmitted only to the FRED API over HTTPS. FRED rate limit: 120 requests/min (free).
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  MAIN APP  ██
+// ═══════════════════════════════════════════════════════════════════════════════
+function TradingDashboard() {
+  const [tab, setTab] = useState("liquidity");
+  const [stock, setStock] = useState("TSM");
+  const [now, setNow] = useState(new Date());
+
+  // Live data state
+  const [liveData, setLiveData] = useState({});           // key → { display, change, signal, sparkData, latestDate }
+  const [loadingKeys, setLoadingKeys] = useState(new Set());
+  const [errorKeys, setErrorKeys] = useState(new Set());
+  const [lastFetched, setLastFetched] = useState(null);
+  const [keysReady, setKeysReady] = useState(
+    FRED_API_KEY !== "YOUR_FRED_API_KEY_HERE"
+  );
+  const [runtimeFredKey, setRuntimeFredKey] = useState(FRED_API_KEY);
+
+  useEffect(() => { const t = setInterval(()=>setNow(new Date()),60000); return ()=>clearInterval(t); },[]);
+
+  const fmt  = d => d.toLocaleDateString("en-US",{weekday:"short",year:"numeric",month:"short",day:"numeric"});
+  const fmtT = d => d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"});
+
+  // ── Fetch all FRED series ─────────────────────────────────────────────────
+  const fetchAllLive = useCallback(async (fredKey) => {
+    const allKeys = Object.keys(FRED_SERIES);
+    setLoadingKeys(new Set(allKeys));
+    setErrorKeys(new Set());
+
+    // Fire all FRED fetches concurrently
+    const results = await Promise.allSettled(
+      Object.entries(FRED_SERIES).map(async ([key, spec]) => {
+        try {
+          const obs = await fetchFredSeries(spec.id, 104);
+          const built = buildDisplayValue(key, obs);
+          return { key, built };
+        } catch(e) {
+          return { key, error: e.message };
+        }
+      })
+    );
+
+    const newLive = { ...liveData };
+    const newErrors = new Set();
+    results.forEach(r => {
+      if (r.status === "fulfilled") {
+        const { key, built, error } = r.value;
+        if (error) newErrors.add(key);
+        else newLive[key] = built;
+      }
+    });
+    setLiveData(newLive);
+    setErrorKeys(newErrors);
+    setLoadingKeys(new Set());
+    setLastFetched(new Date());
+  }, []);
+
+  const handleKeysSubmit = (fredKey) => {
+    window._FRED_KEY = fredKey;
+    setRuntimeFredKey(fredKey);
+    setKeysReady(true);
+    fetchAllLive(fredKey);
+  };
+
+  useEffect(() => {
+    if (keysReady && runtimeFredKey !== "YOUR_FRED_API_KEY_HERE") {
+      window._FRED_KEY = runtimeFredKey;
+      fetchAllLive(runtimeFredKey);
+    }
+  }, []);
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  const isLoading = key => loadingKeys.has(key);
+  const hasError  = key => errorKeys.has(key);
+  const getLive   = key => liveData[key] || null;
+
+  function buildCard(key, tabName) {
+    const meta = CARD_META[key];
+    const live = getLive(key);
+    const loading = isLoading(key) && keysReady;
+    const err = hasError(key);
+    const fallbackSpark = STATIC_SPARK[key];
+
+    return {
+      ...meta,
+      value:       live ? live.display : (loading ? "…" : "—"),
+      change:      live ? live.change  : null,
+      signal:      live ? live.signal  : "neutral",
+      sparkData:   live ? live.sparkData : fallbackSpark,
+      isLive:      true,
+      isLoading:   loading,
+      liveError:   err,
+    };
+  }
+
+  // Compute live SPX % above 200-day (approximation: compare SPX to 200-obs avg)
+  const spxLive = getLive("SPX");
+  let spxAbove200pct = 68; // fallback
+  if (spxLive && spxLive.sparkData && spxLive.sparkData.length >= 10) {
+    // We can't get % of stocks above MA from FRED (that's a breadth indicator)
+    // So we use VIX-derived gauge + keep SPX breadth manual
+    spxAbove200pct = 68;
+  }
+
+  const vixLive = getLive("VIX");
+  const vixVal  = vixLive ? parseFloat(vixLive.display) : 14.2;
+  const vixPct  = vixVal > 40 ? 100 : vixVal > 25 ? 75 : vixVal > 15 ? 40 : 15;
+
+  // ── Derived status summary ─────────────────────────────────────────────────
+  const liveCount  = Object.keys(liveData).length;
+  const totalLive  = Object.keys(FRED_SERIES).length;
+  const isFetching = loadingKeys.size > 0;
+
+  const sd = STOCK_DATA[stock];
+
+  const tabs = [
+    {id:"liquidity",   icon:"◈", label:"Liquidity"},
+    {id:"macro",       icon:"◉", label:"Macro / Leading"},
+    {id:"technicals",  icon:"▲", label:"Technical Analysis"},
+    {id:"stocks",      icon:"◎", label:"Stock Indicators"},
+  ];
+
+  const dotClass = isFetching ? "fetching" : errorKeys.size > 0 ? "error" : liveCount > 0 ? "" : "";
+
+  return (
+    <>
+      <style>{styles}</style>
+      <div className="dashboard">
+
+        {/* ── Header ── */}
+        <div className="header">
+          <div className="header-left">
+            <div className="header-title">MACROSCOPE</div>
+            <div className="header-sub">Institutional Indicators Dashboard — Live Data Edition</div>
+          </div>
+          <div className="header-time">
+            <div><span className={`live-dot ${dotClass}`}/>{fmt(now)}</div>
+            <div style={{color:"var(--text-dim)"}}>
+              {lastFetched ? `Data fetched ${fmtT(lastFetched)}` : `Updated ${fmtT(now)}`}
+            </div>
+            <div style={{fontSize:"9px",marginTop:"2px",color:liveCount>0?"var(--green)":"var(--muted)"}}>
+              {liveCount>0 ? `${liveCount}/${totalLive} LIVE INDICATORS` : "PASTE API KEYS BELOW TO ACTIVATE"}
+            </div>
+          </div>
+        </div>
+
+        {/* ── API Setup Banner (shown if keys not hardcoded) ── */}
+        {(!keysReady || (runtimeFredKey === "YOUR_FRED_API_KEY_HERE")) && (
+          <SetupBanner onKeysSubmit={handleKeysSubmit}/>
+        )}
+
+        {/* ── Status Bar ── */}
+        {keysReady && (
+          <div className="status-bar">
+            <div className={`status-chip ${isFetching?"loading":liveCount>0?"live":"error"}`}>
+              <div className="status-dot"/>
+              {isFetching ? `Fetching… ${liveCount}/${totalLive}` : `FRED: ${liveCount} series live`}
+            </div>
+            <div className="status-chip manual">
+              <div className="status-dot"/>
+              ISM, AAII, NAAIM, Put/Call, McClellan, TSMC: manual
+            </div>
+            {errorKeys.size > 0 && (
+              <div className="status-chip error">
+                <div className="status-dot"/>
+                {errorKeys.size} fetch error{errorKeys.size > 1 ? "s" : ""}
+              </div>
+            )}
+            {lastFetched && (
+              <div className="status-refresh" onClick={()=>fetchAllLive(runtimeFredKey)}>
+                ↻ Refresh
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Tabs ── */}
+        <div className="tabs">
+          {tabs.map(t=>(
+            <div key={t.id} className={`tab ${tab===t.id?"active":""}`} onClick={()=>setTab(t.id)}>
+              <span>{t.icon}</span>{t.label}
+            </div>
+          ))}
+        </div>
+
+        {/* ══════════════════ LIQUIDITY TAB ══════════════════ */}
+        {tab==="liquidity"&&(
+          <>
+            <div className="section-header">
+              <div className="section-title">Liquidity Monitor</div>
+              <div className="section-desc">Druckenmiller Framework — Central Bank &amp; Credit Conditions</div>
+            </div>
+            <div className="framework-banner">
+              "Earnings don't move the overall market — it's the Federal Reserve Board. The key is to watch the central banks and the movement of liquidity. Most people in the market are looking at earnings. I'm focused on what's going to happen 12 to 18 months out."
+              <div className="framework-attr">— STANLEY DRUCKENMILLER</div>
+            </div>
+            <div className="grid" style={{marginTop:"4px"}}>
+              {["FED_BALANCE","RRP","TGA","M2_YOY","NFCI","HY_SPREADS","DXY","CI_LOANS","SOFR"].map(key=>(
+                <MetricCard key={key} {...buildCard(key,"liquidity")}/>
+              ))}
+              {MANUAL_INDICATORS.liquidity.map((ind,i)=>(
+                <MetricCard key={`manual_${i}`} {...ind} isLive={false}/>
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* ══════════════════ MACRO TAB ══════════════════ */}
+        {tab==="macro"&&(
+          <>
+            <div className="section-header">
+              <div className="section-title">Economic Leading Indicators</div>
+              <div className="section-desc">Real economy signals — consumption, credit, industrial activity, sentiment</div>
+            </div>
+            <div className="grid">
+              {["YIELD_CURVE","JOBLESS","NAHB","MICH"].map(key=>(
+                <MetricCard key={key} {...buildCard(key,"macro")}/>
+              ))}
+              {MANUAL_INDICATORS.macro.map((ind,i)=>(
+                <MetricCard key={`macro_manual_${i}`} {...ind} isLive={false}/>
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* ══════════════════ TECHNICALS TAB ══════════════════ */}
+        {tab==="technicals"&&(
+          <>
+            <div className="section-header">
+              <div className="section-title">Technical Analysis</div>
+              <div className="section-desc">Macro Ops Trifecta Framework + Legendary Trader Indicators</div>
+            </div>
+            <div className="framework-banner">
+              "The best trades are the ones in which you have all three things going for you: fundamentals, technical, and market tone."
+              <div className="framework-attr">— MICHAEL MARCUS / MACRO OPS TRIFECTA APPROACH</div>
+            </div>
+            <TrifectaPanel/>
+            <div className="subsection-label" style={{color:"var(--blue)",marginTop:"16px"}}>◈ BREADTH, INTERNALS &amp; SENTIMENT GAUGES</div>
+            <div className="tech-gauges">
+              {/* % Above 200d SMA — manual */}
+              <GaugeCard title="% S&P 500 Stocks Above 200-Day SMA" value="68%" pct={68} color="#22c55e"
+                labels={["Bear <30%","Neutral 30–50%","Bull 50–70%","Ext >70%"]}
+                desc="Broad market participation — 68% of S&P 500 components in long-term uptrends. Above 70% = extended. Below 40% = washout buying zone." isLive={false}/>
+              {/* % Above 50d SMA — manual */}
+              <GaugeCard title="% S&P 500 Stocks Above 50-Day SMA" value="72%" pct={72} color="#3b82f6"
+                labels={["OS <20%","Neutral 30–60%","Strong 60–75%","OB >80%"]}
+                desc="Short-term breadth. At 72%, broad backing. Watch for divergence vs. index as an early warning of a narrow market." isLive={false}/>
+              {/* VIX — LIVE from FRED */}
+              <GaugeCard
+                title="VIX — CBOE Volatility Index"
+                value={vixLive ? vixLive.display : "14.2"}
+                pct={vixPct}
+                color="#22c55e"
+                labels={["Panic >40","Elevated 25–40","Normal 15–25","Complacency <15"]}
+                desc="Fear gauge. Druckenmiller watches VIX regime shifts closely. A sudden spike from low VIX often signals regime change."
+                isLive={true}
+                isLoading={isLoading("VIX")}/>
+              {/* Put/Call — manual */}
+              <GaugeCard {...MANUAL_INDICATORS.technicals.putcall} isLive={false}/>
+              {/* AAII — manual */}
+              <GaugeCard {...MANUAL_INDICATORS.technicals.aaii} isLive={false}/>
+              {/* NAAIM — manual (institutional paywall on Nasdaq Data Link) */}
+              <GaugeCard {...MANUAL_INDICATORS.technicals.naaim} isLive={false}/>
+              {/* McClellan — manual */}
+              <GaugeCard {...MANUAL_INDICATORS.technicals.mcclellan} isLive={false}/>
+              {/* NYSE A/D — manual */}
+              <GaugeCard {...MANUAL_INDICATORS.technicals.nyad} isLive={false}/>
+            </div>
+
+            <div className="legend-header">
+              <div className="legend-title">◉ LEGENDARY TRADER INDICATORS</div>
+              <div className="legend-sub">Druckenmiller · Livermore · Kovner · Marcus — signals these traders have publicly described and used</div>
+            </div>
+            <div className="grid grid-wide">
+              {/* SPX 200-day MA — live from FRED */}
+              {(() => {
+                const spxCard = buildCard("SPX","technicals");
+                return (
+                  <MetricCard
+                    name="SPX Level (vs. 200-Day MA — Druckenmiller)"
+                    value={spxCard.value}
+                    signal={spxCard.signal}
+                    change={spxCard.change}
+                    changePeriod="vs. prev"
+                    sparkData={spxCard.sparkData}
+                    desc="Druckenmiller's primary long-term trend filter. He refuses to hold meaningful long exposure when SPX is below its 200-day. Watch the live value vs. 200-day MA."
+                    source="FRED: SP500 (daily)"
+                    isLive={true}
+                    isLoading={isLoading("SPX")}/>
+                );
+              })()}
+              {/* Moody's Baa — live from FRED */}
+              {(() => {
+                const baaCard = buildCard("MOODY_BAA","technicals");
+                return (
+                  <MetricCard
+                    name="Moody's Baa Yield — Macro Ops / Druck"
+                    value={baaCard.value}
+                    signal={baaCard.signal}
+                    change={baaCard.change}
+                    changePeriod="WoW"
+                    sparkData={baaCard.sparkData}
+                    desc="Macro Ops monitors 26-week % change in Moody's Baa yields. When yields rise fast and cross the upper threshold, equity selloff typically follows within weeks."
+                    source="FRED: BAA (Moody's via FRED)"
+                    isLive={true}
+                    isLoading={isLoading("MOODY_BAA")}/>
+                );
+              })()}
+              {MANUAL_INDICATORS.legend.map((ind,i)=>(
+                <MetricCard key={`legend_${i}`} {...ind} isLive={false}/>
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* ══════════════════ STOCKS TAB ══════════════════ */}
+        {tab==="stocks"&&(
+          <>
+            <div className="section-header">
+              <div className="section-title">Stock-Specific Indicators</div>
+              <div className="section-desc">Leading indicators for core holdings — supply chain, demand signals, competitive positioning</div>
+            </div>
+            <div style={{padding:"12px 28px 0",display:"flex",gap:"10px"}}>
+              {Object.keys(STOCK_DATA).map(t=>(
+                <div key={t} onClick={()=>setStock(t)}
+                  style={{
+                    padding:"8px 20px",cursor:"pointer",borderRadius:"4px",
+                    fontFamily:"var(--display)",fontSize:"16px",letterSpacing:"3px",
+                    transition:"all 0.2s",
+                    border:`1px solid ${stock===t?STOCK_DATA[t].color:"var(--border)"}`,
+                    background:stock===t?`rgba(${t==="TSM"?"59,130,246":t==="GOOGL"?"34,197,94":"245,158,11"},0.1)`:"transparent",
+                    color:stock===t?STOCK_DATA[t].color:"var(--text-dim)"
+                  }}>
+                  {t}
+                </div>
+              ))}
+            </div>
+            <div className="overview-grid">
+              <div className="overview-card"><div className="overview-label">Price</div><div style={{color:sd.color,fontSize:"26px"}}>{sd.price}</div></div>
+              <div className="overview-card"><div className="overview-label">Day Change</div><div style={{color:"#22c55e",fontSize:"26px"}}>{sd.change}</div></div>
+              <div className="overview-card"><div className="overview-label">Bull Indicators</div><div style={{color:"var(--gold)",fontSize:"26px"}}>{sd.indicators.filter(x=>x.signal==="bullish").length}<span style={{fontSize:"14px",color:"var(--text-dim)"}}> / {sd.indicators.length}</span></div></div>
+            </div>
+            <div className="stock-thesis">{sd.thesis}</div>
+            {stock==="TSM"&&<TSMCRevenueChart/>}
+            <div className="grid grid-wide" style={{marginTop:"8px"}}>
+              {sd.indicators.map((ind,i)=><MetricCard key={i} {...ind} isLive={false}/>)}
+            </div>
+          </>
+        )}
+
+        <div className="disclaimer">
+          ⚠ LIVE FRED data (Fed Balance Sheet, RRP, TGA, M2, NFCI, HY Spreads, DXY, C&I Loans, SOFR, Yield Curve, Jobless Claims, Housing Starts, Michigan Sentiment, VIX, Moody's Baa, S&P 500) sourced directly from the St. Louis Fed FRED API.
+          All other indicators (ISM, AAII, NAAIM, Put/Call, McClellan, NYSE A/D, TSMC revenue, stock data) are hardcoded and require manual weekly update. NAAIM is institutional-only on Nasdaq Data Link — update manually each Thursday from naaim.org.
+          TSMC revenue: update ~10th of each month from investor.tsmc.com/english/ir/monthly-sales. Nothing herein constitutes investment advice.
+        </div>
+      </div>
+    </>
+  );
+}
+
+
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<TradingDashboard/>);
+</script>
+</body>
+</html>
